@@ -88,6 +88,11 @@ def native():
     return _resolve("vllm.models.deepseek_v41.nvidia.ops.mhc", "hc_expand")
 
 
+def torch_reference():
+    """Return vLLM's PyTorch implementation used as the correctness oracle."""
+    return _resolve("vllm.model_executor.layers.mhc", "hc_expand")
+
+
 def grid():
     return [
         {
