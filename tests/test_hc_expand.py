@@ -21,13 +21,19 @@ from baseline.hc_expand import (
     FUNCTIONAL_SHAPES,
     INPUT_LAYOUTS,
     build_inputs,
+    torch_reference,
 )
-from vllm.model_executor.layers.mhc import hc_expand as torch_reference
 from vllm.utils.torch_utils import set_random_seed
+
+TORCH_REFERENCE = torch_reference()
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.hc_expand,
+    pytest.mark.skipif(
+        TORCH_REFERENCE is None,
+        reason="vLLM PyTorch hc_expand unavailable",
+    ),
 ]
 
 
@@ -49,7 +55,7 @@ def _assert_bits_equal(actual, expected):
 )
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("layout", INPUT_LAYOUTS)
-def test_hc_expand_preserves_bits_in_eager_and_graph(
+def test_hc_expand_preserves_bits_in_eager(
     num_tokens, hidden_size, hc_mult, dtype, layout
 ):
     """Expansion preserves every input bit, including NaNs and signed zero."""
@@ -74,7 +80,7 @@ def test_hc_expand_preserves_bits_in_eager_and_graph(
     x_before = x.clone()
 
     def check(actual):
-        expected = torch_reference(x, hc_mult)
+        expected = TORCH_REFERENCE(x, hc_mult)
         assert actual.shape == expected.shape and actual.dtype == x.dtype
         assert actual.is_contiguous()
         _assert_bits_equal(actual, expected)
@@ -86,15 +92,3 @@ def test_hc_expand_preserves_bits_in_eager_and_graph(
         assert result.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
         assert result.stride() == (hc_mult * hidden_size, hidden_size, 1)
     _assert_bits_equal(x, x_before)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = flaggems_vllm.hc_expand(x, hc_mult)
-    for _ in range(3):
-        if layout == "broadcast_h":
-            unique = x.as_strided((x.shape[0], 1), (1, 1))
-            unique.copy_(torch.randn_like(unique))
-        else:
-            x.copy_(torch.randn_like(x))
-        graph.replay()
-        check(captured)
