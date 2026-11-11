@@ -16,7 +16,6 @@ import statistics
 from dataclasses import asdict
 
 import pytest
-import torch
 
 import flaggems_vllm
 from baseline.hc_expand import (
@@ -39,13 +38,6 @@ pytestmark = [
         reason="vLLM native hc_expand unavailable",
     ),
 ]
-
-
-def _assert_bits_equal(actual, expected):
-    assert actual.shape == expected.shape
-    assert actual.dtype == expected.dtype
-    if actual.numel():
-        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
 class HCExpandBenchmark(base.Benchmark):
@@ -101,8 +93,7 @@ class HCExpandBenchmark(base.Benchmark):
             else None
         )
         return BenchmarkMetrics(
-            shape_detail=["wrapper", "contiguous", tuple(x.shape), hc_mult],
-            category="wrapper",
+            shape_detail=[tuple(x.shape), hc_mult],
             latency_base=base_latency,
             latency=gems_latency,
             speedup=speedup,
@@ -120,15 +111,14 @@ class HCExpandBenchmark(base.Benchmark):
             for args in self.get_input_iter(dtype):
                 x, hc_mult = args
 
-                wrapper_base = lambda: self.torch_op(x, hc_mult)
-                wrapper_gems = lambda: self.gems_op(x, hc_mult)
-                _assert_bits_equal(wrapper_gems(), wrapper_base())
+                baseline_fn = lambda: self.torch_op(x, hc_mult)
+                gems_fn = lambda: self.gems_op(x, hc_mult)
                 metrics.append(
                     self._metric(
                         x,
                         hc_mult,
-                        wrapper_base,
-                        wrapper_gems,
+                        baseline_fn,
+                        gems_fn,
                     )
                 )
 

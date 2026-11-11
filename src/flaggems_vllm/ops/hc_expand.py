@@ -20,6 +20,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+
 
 @triton.jit
 def _hc_expand_kernel(
@@ -86,6 +88,7 @@ def _launch_hc_expand_kernel(x, out, hc_mult, kernel=_hc_expand_kernel):
     }
     if (
         numel >= (1 << 24)
+        and runtime.device.vendor_name == "nvidia"
         and x.device.type == "cuda"
         and torch.version.hip is None
     ):
