@@ -14,15 +14,20 @@
 
 """Triton implementation of the mHC stream expansion operation."""
 
-from functools import lru_cache
-
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.utils import libentry, libtuner
 
 
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("hc_expand"),
+    key=["numel", "H", "N"],
+    strategy=["log", "default", "default"],
+)
 @triton.jit
 def _hc_expand_kernel(
     x,
@@ -43,73 +48,6 @@ def _hc_expand_kernel(
         tl.store(out + (row * N + stream) * H + col, value, mask=mask)
 
 
-def _launch_config(numel, dtype):
-    if numel < (1 << 20):
-        return 256, 2
-    if numel < (1 << 21):
-        return (1024, 4) if dtype == torch.bfloat16 else (512, 2)
-    if numel < (1 << 22):
-        return 1024, 4
-    if numel < (1 << 24):
-        return 4096, 8
-    return 1024, 8
-
-
-@lru_cache(maxsize=None)
-def _supports_cta_clusters(device_index):
-    return torch.cuda.get_device_capability(device_index)[0] >= 9
-
-
-def _launch_hc_expand_kernel(x, out, hc_mult, kernel=_hc_expand_kernel):
-    if not out.numel():
-        return
-    num_tokens, hidden_size = x.shape
-    numel = num_tokens * hidden_size
-
-    # Small inputs are launch-latency bound. Avoid the generic launch-config
-    # path and use their fixed, pre-tuned configuration directly.
-    if numel < (1 << 20):
-        kernel[(triton.cdiv(numel, 256),)](
-            x,
-            out,
-            numel,
-            hidden_size,
-            hc_mult,
-            *x.stride(),
-            BLOCK=256,
-            num_warps=2,
-            num_stages=2,
-        )
-        return
-
-    block, num_warps = _launch_config(numel, x.dtype)
-    launch_options = {
-        "num_stages": 3,
-    }
-    if (
-        numel >= (1 << 24)
-        and runtime.device.vendor_name == "nvidia"
-        and x.device.type == "cuda"
-        and torch.version.hip is None
-    ):
-        device_index = x.device.index
-        if device_index is None:
-            device_index = torch.cuda.current_device()
-        if _supports_cta_clusters(device_index):
-            launch_options["num_ctas"] = 2
-    kernel[(triton.cdiv(num_tokens * hidden_size, block),)](
-        x,
-        out,
-        num_tokens * hidden_size,
-        hidden_size,
-        hc_mult,
-        *x.stride(),
-        BLOCK=block,
-        num_warps=num_warps,
-        **launch_options,
-    )
-
-
 def hc_expand(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
     """``x.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()``.
 
@@ -119,5 +57,14 @@ def hc_expand(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
     m, h = x.shape
     out = x.new_empty(m, hc_mult, h)
     if out.numel():
-        _launch_hc_expand_kernel(x, out, hc_mult)
+        numel = m * h
+        grid = lambda META: (triton.cdiv(numel, META["BLOCK"]),)
+        _hc_expand_kernel[grid](
+            x,
+            out,
+            numel,
+            h,
+            hc_mult,
+            *x.stride(),
+        )
     return out
