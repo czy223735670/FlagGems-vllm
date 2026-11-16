@@ -42,8 +42,8 @@ def _assert_bits_equal(actual, expected):
     assert actual.dtype == expected.dtype
     if actual.numel():
         torch.testing.assert_close(
-            actual.clone(memory_format=torch.contiguous_format).view(torch.uint8),
-            expected.clone(memory_format=torch.contiguous_format).view(torch.uint8),
+            actual.contiguous().view(torch.uint8),
+            expected.contiguous().view(torch.uint8),
             rtol=0,
             atol=0,
         )
