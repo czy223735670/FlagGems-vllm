@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import statistics
-from dataclasses import asdict
-
 import pytest
 
 import flaggems_vllm
@@ -23,117 +20,55 @@ from baseline.hc_expand import (
     OP_NAME,
     build_inputs,
     native,
+    torch_reference,
 )
 
-from . import base, conftest as cfg
-from .consts import BenchmarkMetrics, BenchmarkResult
+from . import base
 
-VLLM_NATIVE = native()
-MEASUREMENT_ROUNDS = 4
+if flaggems_vllm.vendor_name == "ascend":
+    PERFORMANCE_BASELINE = torch_reference()
+else:
+    PERFORMANCE_BASELINE = native()
 
 pytestmark = [
     pytest.mark.hc_expand,
     pytest.mark.skipif(
-        VLLM_NATIVE is None,
-        reason="vLLM native hc_expand unavailable",
+        PERFORMANCE_BASELINE is None,
+        reason="hc_expand performance baseline unavailable",
     ),
 ]
 
 
 class HCExpandBenchmark(base.Benchmark):
     def __init__(self, dtype):
-        super().__init__(OP_NAME, VLLM_NATIVE, [dtype], is_inplace=False)
+        super().__init__(OP_NAME, PERFORMANCE_BASELINE, [dtype], is_inplace=False)
+        self.layouts = ("contiguous", "strided")
+        self.current_layout = None
         self.set_gems(flaggems_vllm.hc_expand)
 
     def get_input_iter(self, dtype):
-        for num_tokens, hidden_size, hc_mult in self.shapes:
-            binding = {
-                "num_tokens": num_tokens,
-                "hidden_size": hidden_size,
-                "hc_mult": hc_mult,
-            }
-            args, _ = build_inputs(
-                binding,
-                dtype,
-                self.device,
-                special_values=False,
-            )
-            yield args
-
-    def _measure_pair(self, base_fn, gems_fn):
-        base_samples = []
-        gems_samples = []
-        for round_index in range(MEASUREMENT_ROUNDS):
-            order = (
-                (("base", base_fn), ("gems", gems_fn))
-                if round_index % 2 == 0
-                else (("gems", gems_fn), ("base", base_fn))
-            )
-            samples = {}
-            for name, fn in order:
-                samples[name] = float(self.get_latency(fn))
-            base_samples.append(samples["base"])
-            gems_samples.append(samples["gems"])
-
-        base_latency = statistics.median(base_samples)
-        gems_latency = statistics.median(gems_samples)
-        return base_latency, gems_latency, base_latency / gems_latency
-
-    def _metric(self, x, hc_mult, base_fn, gems_fn):
-        base_latency, gems_latency, speedup = self._measure_pair(base_fn, gems_fn)
-        payload_bytes = x.numel() * (1 + hc_mult) * x.element_size()
-        gbps_base = (
-            payload_bytes / (base_latency * 1e-3) / 1e9
-            if base_latency
-            else None
-        )
-        gbps = (
-            payload_bytes / (gems_latency * 1e-3) / 1e9
-            if gems_latency
-            else None
-        )
-        return BenchmarkMetrics(
-            shape_detail=[tuple(x.shape), hc_mult],
-            latency_base=base_latency,
-            latency=gems_latency,
-            speedup=speedup,
-            gbps_base=gbps_base,
-            gbps=gbps,
-        )
-
-    def run(self):
-        if cfg.Config.query:
-            return super().run()
-
-        self.init_user_config()
-        for dtype in self.to_bench_dtypes:
-            metrics = []
-            for args in self.get_input_iter(dtype):
-                x, hc_mult = args
-
-                baseline_fn = lambda: self.torch_op(x, hc_mult)
-                gems_fn = lambda: self.gems_op(x, hc_mult)
-                metrics.append(
-                    self._metric(
-                        x,
-                        hc_mult,
-                        baseline_fn,
-                        gems_fn,
-                    )
+        for layout in self.layouts:
+            self.current_layout = layout
+            for num_tokens, hidden_size, hc_mult in self.shapes:
+                binding = {
+                    "num_tokens": num_tokens,
+                    "hidden_size": hidden_size,
+                    "hc_mult": hc_mult,
+                }
+                args, _ = build_inputs(
+                    binding,
+                    dtype,
+                    self.device,
+                    layout=layout,
+                    special_values=False,
                 )
+                yield args
 
-            result = BenchmarkResult(
-                level=cfg.Config.bench_level.value,
-                op_name=self.op_name,
-                dtype=str(dtype),
-                mode=cfg.Config.mode.value,
-                result=metrics,
-            )
-            print(result)
-            cfg.update_result(self.op_name, asdict(result))
-            cfg.emit_record_logger(result.to_json())
+    def record_shapes(self, *args, **kwargs):
+        return [self.current_layout, *super().record_shapes(*args, **kwargs)]
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=str)
 def test_hc_expand(dtype):
-    HCExpandBenchmark(dtype).run()
+    bench = HCExpandBenchmark(dtype)
+    bench.run()

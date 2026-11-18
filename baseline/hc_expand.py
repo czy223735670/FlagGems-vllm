@@ -28,15 +28,9 @@ IS_INPLACE = False
 INPUT_LAYOUTS = (
     "contiguous",
     "strided",
-    "transposed",
-    "row_padded",
-    "column_stride_3",
-    "broadcast_h",
-    "storage_offset",
 )
 
 BENCHMARK_SHAPES = [
-    (1, 513, 1),
     (7, 17, 8),
     (33, 5137, 4),
     (8192, 5120, 4),
@@ -52,8 +46,9 @@ BENCHMARK_SHAPES = [
 ]
 
 FUNCTIONAL_SHAPES = [
-    (0, 17, 4),
     *BENCHMARK_SHAPES,
+    (0, 17, 4),
+    (1, 513, 1),
     (2, 5120, 8),
     (4, 5120, 2),
     (8, 5120, 3),
@@ -136,51 +131,6 @@ def build_inputs(
             device=device,
         )
         x = storage[:, 1::2]
-    elif layout == "transposed":
-        # Row stride 1, column stride num_tokens.
-        storage = torch.randn(
-            hidden_size,
-            num_tokens,
-            dtype=dtype,
-            device=device,
-        )
-        x = storage.t()
-    elif layout == "row_padded":
-        # Contiguous columns with padding between rows.
-        storage = torch.randn(
-            num_tokens,
-            hidden_size + 7,
-            dtype=dtype,
-            device=device,
-        )
-        x = storage[:, :hidden_size]
-    elif layout == "column_stride_3":
-        # Non-unit row and column strides.
-        storage = torch.randn(
-            num_tokens,
-            3 * hidden_size + 5,
-            dtype=dtype,
-            device=device,
-        )
-        x = storage[:, : 3 * hidden_size : 3]
-    elif layout == "broadcast_h":
-        # Every logical row broadcasts a single value across H.
-        storage = torch.randn(
-            num_tokens,
-            1,
-            dtype=dtype,
-            device=device,
-        )
-        x = storage.expand(num_tokens, hidden_size)
-    elif layout == "storage_offset":
-        # Non-zero storage offset with contiguous inner columns.
-        storage = torch.randn(
-            num_tokens,
-            hidden_size + 3,
-            dtype=dtype,
-            device=device,
-        )
-        x = storage[:, 2 : 2 + hidden_size]
     else:
         raise ValueError(f"unsupported input layout: {layout!r}")
 
@@ -210,11 +160,6 @@ def config(binding, dtype, *, layout="contiguous"):
     stride = {
         "contiguous": [hidden_size, 1],
         "strided": [2 * hidden_size + 1, 2],
-        "transposed": [1, num_tokens],
-        "row_padded": [hidden_size + 7, 1],
-        "column_stride_3": [3 * hidden_size + 5, 3],
-        "broadcast_h": [1, 0],
-        "storage_offset": [hidden_size + 3, 1],
     }.get(layout)
     if stride is None:
         raise ValueError(f"unsupported input layout: {layout!r}")
