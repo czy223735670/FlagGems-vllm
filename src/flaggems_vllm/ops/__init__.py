@@ -102,6 +102,7 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_inser
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
+from flaggems_vllm.ops.fused_save_compress_norm import fused_save_compress_norm
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from flaggems_vllm.ops.fused_indexer_k_norm import fused_indexer_k_norm
 from flaggems_vllm.ops.fused_indexer_q_rope_quant import fused_indexer_q_rope_quant
@@ -354,6 +355,7 @@ __all__ = [
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_recurrent_kda",
+    "fused_save_compress_norm",
     "fwht128_quant_fp8",
     "gate_sigmoid_mul",
     "gather_draft_sampled",

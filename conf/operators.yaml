@@ -1095,6 +1095,21 @@ ops:
   - Attention
   stages:
   - beta: '0.3'
+- id: fused_save_compress_norm
+  description: |
+    DeepSeek V4.1 compressed-KV state saving, learned softmax pooling and
+    RMSNorm. CR2 maintains one ring state block per request so token groups
+    can span packed inference chunks.
+  for:
+  - vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache.fused_save_compress_norm
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: gate_sigmoid_mul
   description: Applies the sigmoid output gate to Kimi-K3 MLA attention output.
   for:
