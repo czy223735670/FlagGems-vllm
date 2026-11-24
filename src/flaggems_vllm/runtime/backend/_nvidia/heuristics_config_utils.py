@@ -108,6 +108,41 @@ def qsa_sparse_launch_config_heur(args):
     return 64, 8, 2
 
 
+def fused_save_compress_norm_launch_config_heur(args):
+    """(ITEMS_PER_PROGRAM, num_warps, num_stages) for state save/pooling.
+
+    CR1 is a streaming pointwise RMSNorm path. CR2 spends most of its time on
+    the pooled raw pair. Thresholds come from an offline sweep of the core
+    shapes; no runtime autotuning is performed.
+    """
+    num_tokens = args["num_tokens"]
+    compress_ratio = args["COMPRESS_RATIO"]
+    if compress_ratio == 1:
+        if num_tokens <= 8:
+            return 2, 1, 1
+        if num_tokens <= 512:
+            return 1, 2, 1
+        if num_tokens <= 2048:
+            return 1, 1, 1
+        if num_tokens <= 4096:
+            return 8, 4, 1
+        if num_tokens <= 8192:
+            return 2, 2, 1
+        return 2, 1, 1
+
+    if num_tokens <= 8:
+        return 1, 4, 3
+    if num_tokens <= 2048:
+        return 1, 4, 1
+    if num_tokens <= 4096:
+        return 2, 4, 3
+    if num_tokens <= 8192:
+        return 2, 2, 1
+    if num_tokens <= 16384:
+        return 2, 4, 2
+    return 2, 2, 1
+
+
 def simple_elementwise_blocksize_heur(args):
     return 1024
 
@@ -542,6 +577,9 @@ HEURISTICS_CONFIGS = {
     "qsa_sparse_paged_attention": {
         "NUM_SPLITS": qsa_sparse_num_splits_heur,
         "LAUNCH_CONFIG": qsa_sparse_launch_config_heur,
+    },
+    "fused_save_compress_norm": {
+        "LAUNCH_CONFIG": fused_save_compress_norm_launch_config_heur,
     },
     "softmax_inner": {
         "TILE_N": softmax_heur_tile_n_inner,

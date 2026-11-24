@@ -22,7 +22,7 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import device, torch_device_fn
-from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils import libentry
 
 
 # The ring and raw rows a ratio-2 request program pools are not adjacent, so
@@ -36,10 +36,7 @@ try:
     )
 except Exception:
     _LAUNCH_PDL_SUPPORTED = False
-_EMPTY_STATES = {}
-_AUTOTUNE_CONFIGS = runtime.get_tuned_config("fused_save_compress_norm") or [
-    triton.Config({"ITEMS_PER_PROGRAM": 1}, num_warps=4, num_stages=3)
-]
+_HEURISTICS = runtime.get_heuristic_config("fused_save_compress_norm")
 _LAUNCH_KWARGS = (
     {"launch_pdl": False}
     if device.vendor_name == "nvidia" and _LAUNCH_PDL_SUPPORTED
@@ -47,14 +44,25 @@ _LAUNCH_KWARGS = (
 )
 
 
-def _autotune_state(state_cache, target_device):
-    if state_cache is not None:
-        return state_cache
-    cached = _EMPTY_STATES.get(target_device)
-    if cached is None:
-        cached = torch.empty(1, dtype=torch.float32, device=target_device)
-        _EMPTY_STATES[target_device] = cached
-    return cached
+def _launch_config(num_tokens, num_reqs, compress_ratio, state_block):
+    if not _HEURISTICS or "LAUNCH_CONFIG" not in _HEURISTICS:
+        raise NotImplementedError(
+            "No fused_save_compress_norm heuristic config for this backend"
+        )
+    config = _HEURISTICS["LAUNCH_CONFIG"](
+        {
+            "num_tokens": num_tokens,
+            "num_reqs": num_reqs,
+            "COMPRESS_RATIO": compress_ratio,
+            "STATE_BLOCK": state_block,
+        }
+    )
+    if len(config) != 3:
+        raise ValueError(
+            "fused_save_compress_norm heuristic must return "
+            "(ITEMS_PER_PROGRAM, num_warps, num_stages)"
+        )
+    return config
 
 
 def fused_save_compress_norm(
@@ -79,12 +87,12 @@ def fused_save_compress_norm(
     ``block * capacity + p % capacity``. The grid has one program per request
     followed by one per ``ITEMS_PER_PROGRAM`` packed groups. A request program
     handles the group that the chunk's first token closes with its
-    predecessor's ring row, then stores the chunk's last ``capacity`` rows to
-    the ring; because the same program does both, ring reads and writes never
-    race. A group program handles the groups that end inside its tile, reading
-    both rows from the raw input. Ratio 1 has no ring and each program handles
-    up to ``ITEMS_PER_PROGRAM`` valid tokens; ``slot_mapping`` then only marks
-    valid tokens.
+    predecessor's ring row. It also owns the chunk's first, last, and
+    predecessor-collision tail rows. Group programs store the remaining tail
+    rows from the pair they already load for pooling, so the raw rows are not
+    read a second time. Ratio 1 has no ring and each program handles up to
+    ``ITEMS_PER_PROGRAM`` valid tokens; ``slot_mapping`` then only marks valid
+    tokens.
 
     Args:
         kv_score: FP32 [tokens, 512] for CR1, [tokens, 1024] for CR2.
@@ -128,22 +136,23 @@ def fused_save_compress_norm(
     assert num_tokens <= min(kv_score.shape[0], positions.numel())
     if num_tokens == 0:
         return
-    tune_state = _autotune_state(state_cache, kv_score.device)
+    items_per_program, num_warps, num_stages = _launch_config(
+        num_tokens,
+        num_reqs,
+        compress_ratio,
+        state_block,
+    )
 
-    def grid(meta):
-        return (
-            num_reqs
-            + triton.cdiv(
-                num_tokens,
-                compress_ratio * meta["ITEMS_PER_PROGRAM"],
-            ),
-        )
+    grid = num_reqs + triton.cdiv(
+        num_tokens,
+        compress_ratio * items_per_program,
+    )
 
     with torch_device_fn.device(kv_score.device):
-        _fused_save_compress_norm_grouped_kernel[grid](
+        _fused_save_compress_norm_grouped_kernel[(grid,)](
             kv_score,
             positions,
-            tune_state,
+            state_cache,
             slot_mapping,
             query_start_loc,
             token_to_req_indices,
@@ -158,17 +167,14 @@ def fused_save_compress_norm(
             COMPRESS_RATIO=compress_ratio,
             EPS=rms_norm_eps,
             JOIN_ROW_PTRS=_JOIN_ROW_PTRS,
+            ITEMS_PER_PROGRAM=items_per_program,
+            num_warps=num_warps,
+            num_stages=num_stages,
             **_LAUNCH_KWARGS,
         )
 
 
 @libentry()
-@libtuner(
-    configs=_AUTOTUNE_CONFIGS,
-    key=["num_tokens", "num_reqs", "COMPRESS_RATIO"],
-    strategy=["log", "default", "default"],
-    restore_value=["state"],
-)
 @triton.jit
 def _fused_save_compress_norm_grouped_kernel(
     raw,
@@ -209,43 +215,26 @@ def _fused_save_compress_norm_grouped_kernel(
                 ring = state + (state_slot // STATE_BLOCK).to(tl.int64) * STATE_STRIDE
                 prev = ring + ((position - 1) % STATE_BLOCK) * STATE_ROW_STRIDE
                 current = raw + start.to(tl.int64) * RAW_STRIDE
-                if JOIN_ROW_PTRS:
-                    # Joining pointers hides row alignment from Triton; restate it.
-                    rows = tl.multiple_of(tl.join(prev, current)[:, None], (16, 16))
-                    kv = tl.load(rows + d[None, :])
-                    score = tl.load(rows + 512 + d[None, :])
-                    # Every lane has read the ring before the tail store below
-                    # writes it.
-                    tl.debug_barrier()
-                    pooled = tl.sum(kv * tl.softmax(score, 0), 0)
-                else:
-                    kv_prev = tl.load(prev + d)
-                    score_prev = tl.load(prev + 512 + d)
-                    kv_current = tl.load(current + d)
-                    score_current = tl.load(current + 512 + d)
-                    # Every lane has read the ring before the tail store below
-                    # writes it.
-                    tl.debug_barrier()
-                    peak = tl.maximum(score_prev, score_current)
-                    weight_prev = tl.exp(score_prev - peak)
-                    weight_current = tl.exp(score_current - peak)
-                    pooled = (kv_prev * weight_prev + kv_current * weight_current) / (
-                        weight_prev + weight_current
-                    )
+                pooled = _pool_with_previous(
+                    prev,
+                    current,
+                    d,
+                    JOIN_ROW_PTRS,
+                )
                 _store_latent(pooled, start, norm_weight, latent, d, EPS)
-            num_rows = tl.minimum(end - start, STATE_BLOCK)
-            state_d = tl.arange(0, 1024)
-            for k in tl.range(0, num_rows):
-                token = end - num_rows + k
-                slot = tl.load(state_slots + token)
-                if slot >= 0:
-                    row = (
-                        state
-                        + (slot // STATE_BLOCK).to(tl.int64) * STATE_STRIDE
-                        + (slot % STATE_BLOCK) * STATE_ROW_STRIDE
-                    )
-                    src = raw + token.to(tl.int64) * RAW_STRIDE
-                    tl.store(row + state_d, tl.load(src + state_d))
+
+            _store_request_tail(
+                raw,
+                state,
+                state_slots,
+                start,
+                end,
+                d,
+                RAW_STRIDE,
+                STATE_STRIDE,
+                STATE_ROW_STRIDE,
+                STATE_BLOCK,
+            )
             return
 
     if COMPRESS_RATIO == 1:
@@ -281,8 +270,10 @@ def _fused_save_compress_norm_grouped_kernel(
             mask=valid[:, None],
         )
     else:
-        # Several pairs per program. A chunk's first token belongs to its
-        # request program.
+        # Several pairs per program. The request program owns each chunk's
+        # first token, last token, and predecessor-ring collision token. This
+        # program stores the remaining tail rows from the pair it already
+        # loaded for pooling.
         first_group = (
             (pid - num_reqs) * COMPRESS_RATIO * ITEMS_PER_PROGRAM
         ).to(tl.int64)
@@ -291,17 +282,211 @@ def _fused_save_compress_norm_grouped_kernel(
             if base_t < num_tokens:
                 t = base_t + (tl.load(positions + base_t) + 1).to(tl.int64) % 2
                 if t < num_tokens:
+                    req = tl.load(req_ids + t)
+                    start = tl.load(query_start_loc + req).to(tl.int64)
+                    end = tl.load(query_start_loc + req + 1).to(tl.int64)
                     state_slot = tl.load(state_slots + t)
-                    if state_slot >= 0:
-                        if t != tl.load(query_start_loc + tl.load(req_ids + t)):
-                            rows = (
-                                raw
-                                + (t - 1 + tl.arange(0, 2)[:, None]) * RAW_STRIDE
-                            )
-                            kv = tl.load(rows + d[None, :])
-                            score = tl.load(rows + 512 + d[None, :])
+                    if t != start:
+                        rows = (
+                            raw
+                            + (t - 1 + tl.arange(0, 2)[:, None]) * RAW_STRIDE
+                        )
+                        kv = tl.load(rows + d[None, :])
+                        score = tl.load(rows + 512 + d[None, :])
+                        if state_slot >= 0:
                             pooled = tl.sum(kv * tl.softmax(score, 0), 0)
                             _store_latent(pooled, t, norm_weight, latent, d, EPS)
+                        _store_group_state(
+                            kv,
+                            score,
+                            t,
+                            start,
+                            end,
+                            state,
+                            state_slots,
+                            d,
+                            STATE_STRIDE,
+                            STATE_ROW_STRIDE,
+                            STATE_BLOCK,
+                        )
+@triton.jit
+def _pool_with_previous(prev, current, d, JOIN_ROW_PTRS: tl.constexpr):
+    if JOIN_ROW_PTRS:
+        # Joining pointers hides row alignment from Triton; restate it.
+        rows = tl.multiple_of(tl.join(prev, current)[:, None], (16, 16))
+        kv = tl.load(rows + d[None, :])
+        score = tl.load(rows + 512 + d[None, :])
+        # Every lane has read the ring before the tail store below writes it.
+        tl.debug_barrier()
+        return tl.sum(kv * tl.softmax(score, 0), 0)
+
+    kv_prev = tl.load(prev + d)
+    score_prev = tl.load(prev + 512 + d)
+    kv_current = tl.load(current + d)
+    score_current = tl.load(current + 512 + d)
+    # Every lane has read the ring before the tail store below writes it.
+    tl.debug_barrier()
+    peak = tl.maximum(score_prev, score_current)
+    weight_prev = tl.exp(score_prev - peak)
+    weight_current = tl.exp(score_current - peak)
+    return (kv_prev * weight_prev + kv_current * weight_current) / (
+        weight_prev + weight_current
+    )
+
+
+@triton.jit
+def _state_row_ptr(
+    state,
+    slot,
+    STATE_STRIDE: tl.constexpr,
+    STATE_ROW_STRIDE: tl.constexpr,
+    STATE_BLOCK: tl.constexpr,
+):
+    return (
+        state
+        + (slot // STATE_BLOCK).to(tl.int64) * STATE_STRIDE
+        + (slot % STATE_BLOCK) * STATE_ROW_STRIDE
+    )
+
+
+@triton.jit
+def _collision_token(length, end, STATE_BLOCK: tl.constexpr):
+    end_token = end - 1
+    return tl.where(
+        length >= STATE_BLOCK,
+        end_token - length % STATE_BLOCK,
+        -1,
+    )
+
+
+@triton.jit
+def _store_request_tail(
+    raw,
+    state,
+    state_slots,
+    start,
+    end,
+    d,
+    RAW_STRIDE: tl.constexpr,
+    STATE_STRIDE: tl.constexpr,
+    STATE_ROW_STRIDE: tl.constexpr,
+    STATE_BLOCK: tl.constexpr,
+):
+    length = end - start
+    end_token = end - 1
+    if length <= STATE_BLOCK:
+        _copy_state_row(
+            raw,
+            state,
+            state_slots,
+            start,
+            d,
+            RAW_STRIDE,
+            STATE_STRIDE,
+            STATE_ROW_STRIDE,
+            STATE_BLOCK,
+        )
+    if end_token != start:
+        _copy_state_row(
+            raw,
+            state,
+            state_slots,
+            end_token,
+            d,
+            RAW_STRIDE,
+            STATE_STRIDE,
+            STATE_ROW_STRIDE,
+            STATE_BLOCK,
+        )
+    if length >= STATE_BLOCK:
+        collision = _collision_token(length, end, STATE_BLOCK)
+        if collision != start and collision != end_token:
+            _copy_state_row(
+                raw,
+                state,
+                state_slots,
+                collision,
+                d,
+                RAW_STRIDE,
+                STATE_STRIDE,
+                STATE_ROW_STRIDE,
+                STATE_BLOCK,
+            )
+
+
+@triton.jit
+def _store_group_state(
+    kv,
+    score,
+    t,
+    start,
+    end,
+    state,
+    state_slots,
+    d,
+    STATE_STRIDE: tl.constexpr,
+    STATE_ROW_STRIDE: tl.constexpr,
+    STATE_BLOCK: tl.constexpr,
+):
+    length = end - start
+    tail_start = end - tl.minimum(length, STATE_BLOCK)
+    pair_tokens = t - 1 + tl.arange(0, 2).to(tl.int64)
+    pair_slots = tl.load(state_slots + pair_tokens)
+    start_slot = tl.load(state_slots + start)
+    end_token = end - 1
+    collision = _collision_token(length, end, STATE_BLOCK)
+    store_pair = (
+        (pair_tokens >= tail_start)
+        & (pair_tokens < end)
+        & (pair_slots >= 0)
+        & (start_slot >= 0)
+        & (pair_tokens != start)
+        & (pair_tokens != end_token)
+        & (pair_tokens != collision)
+    )
+    state_rows = _state_row_ptr(
+        state,
+        pair_slots,
+        STATE_STRIDE,
+        STATE_ROW_STRIDE,
+        STATE_BLOCK,
+    )[:, None]
+    tl.store(
+        state_rows + d[None, :],
+        kv,
+        mask=store_pair[:, None],
+    )
+    tl.store(
+        state_rows + 512 + d[None, :],
+        score,
+        mask=store_pair[:, None],
+    )
+
+
+@triton.jit
+def _copy_state_row(
+    raw,
+    state,
+    state_slots,
+    token,
+    d,
+    RAW_STRIDE: tl.constexpr,
+    STATE_STRIDE: tl.constexpr,
+    STATE_ROW_STRIDE: tl.constexpr,
+    STATE_BLOCK: tl.constexpr,
+):
+    slot = tl.load(state_slots + token)
+    if slot >= 0:
+        row = _state_row_ptr(
+            state,
+            slot,
+            STATE_STRIDE,
+            STATE_ROW_STRIDE,
+            STATE_BLOCK,
+        )
+        src = raw + token.to(tl.int64) * RAW_STRIDE
+        tl.store(row + d, tl.load(src + d))
+        tl.store(row + 512 + d, tl.load(src + 512 + d))
 
 
 @triton.jit

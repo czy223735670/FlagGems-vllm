@@ -94,19 +94,6 @@ def _assert_results(args, expected_state, expected_latent, kv_before):
     )
 
 
-class _MemoryLibCache:
-    """Small in-memory replacement for the persistent tuner caches."""
-
-    def __init__(self):
-        self.configs = {}
-        self.benchmarks = {}
-
-    def __getitem__(self, key):
-        if isinstance(key, str):
-            return self.configs.setdefault(key, {})
-        return self.benchmarks.setdefault(key, {})
-
-
 @pytest.mark.fused_save_compress_norm
 @pytest.mark.parametrize("compress_ratio", [1, 2])
 @pytest.mark.parametrize("use_graph", [False, True])
@@ -172,84 +159,103 @@ def test_invalid_slots_match_reference(compress_ratio):
     _run_and_compare(args)
 
 
+@pytest.mark.parametrize(
+    "lengths,start_positions",
+    [
+        ((7, 8, 8), (7, 8, 13)),
+        ((9, 10, 11), (8, 9, 10)),
+    ],
+)
 @torch.inference_mode()
-def test_autotune_preserves_first_call_state(monkeypatch):
-    """Every autotune candidate must leave the original CR2 history intact."""
-    torch.manual_seed(17)
-    args, _ = build_inputs(
-        {
-            "num_tokens": 77,
-            "num_reqs": 7,
-            "block_nums": 14,
-            "compress_ratio": 2,
-        },
-        torch.float32,
-        DEVICE,
+def test_ratio2_fused_state_store_ring_edges(lengths, start_positions):
+    """Exercise endpoint ownership and predecessor-slot collisions."""
+    torch.manual_seed(23)
+    capacity = 8
+    actual_tokens = sum(lengths)
+    positions = torch.empty(actual_tokens, dtype=torch.int64, device=DEVICE)
+    slots = torch.empty_like(positions)
+    query_start_loc = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=DEVICE,
     )
-    kv_score, positions, state, slots, query_start_loc, _, _, _, _, latent = args
-    capacity = state.shape[1]
+    req_ids = torch.repeat_interleave(
+        torch.arange(len(lengths), dtype=torch.int32, device=DEVICE),
+        torch.tensor(lengths, dtype=torch.int64, device=DEVICE),
+    )
+    blocks = (2, 0, 1)
+    cursor = 0
+    for req, (length, position) in enumerate(zip(lengths, start_positions)):
+        rows = slice(cursor, cursor + length)
+        req_positions = torch.arange(
+            position,
+            position + length,
+            dtype=torch.int64,
+            device=DEVICE,
+        )
+        positions[rows] = req_positions
+        slots[rows] = blocks[req] * capacity + req_positions % capacity
+        cursor += length
 
-    # Shift every request by one position so its first token closes a group
-    # using the history row restored by the autotuner.
-    for req in range(query_start_loc.numel() - 1):
-        start = int(query_start_loc[req].item())
-        end = int(query_start_loc[req + 1].item())
-        block = int(slots[start].item()) // capacity
-        req_positions = positions[start:end] + 1
-        positions[start:end] = req_positions
-        slots[start:end] = block * capacity + req_positions % capacity
+    state = torch.randn(
+        3,
+        capacity,
+        1024,
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    args = (
+        torch.randn(actual_tokens, 1024, dtype=torch.float32, device=DEVICE),
+        positions,
+        state,
+        slots,
+        query_start_loc,
+        req_ids,
+        torch.randn(512, dtype=torch.bfloat16, device=DEVICE),
+        1e-20,
+        2,
+        torch.empty(actual_tokens, 512, dtype=torch.bfloat16, device=DEVICE),
+    )
+    args[-1].fill_(float("nan"))
+    _run_and_compare(args)
 
-    history = state.clone()
-    expected_state, expected_latent = torch_reference(*args)
-    latent.fill_(float("nan"))
-    kv_before = kv_score.clone()
 
+def test_backend_heuristic_launch_config():
     op_module = importlib.import_module(
         "flaggems_vllm.ops.fused_save_compress_norm"
     )
-    libentry_module = importlib.import_module("flaggems_vllm.utils.libentry")
-    tuner = op_module._fused_save_compress_norm_grouped_kernel.fn
-    if len(tuner.configs) <= 1:
-        pytest.skip("backend does not provide a multi-config autotune space")
+    heuristics = op_module._HEURISTICS
+    assert heuristics is not None
+    select = heuristics["LAUNCH_CONFIG"]
 
-    # Use fresh in-memory caches so this test always executes every candidate
-    # and cannot pass by accidentally loading a persistent tuning result.
-    memory_cache = _MemoryLibCache()
-    monkeypatch.setattr(libentry_module, "libcache", memory_cache)
-    monkeypatch.setattr(
-        tuner,
-        "cache",
-        memory_cache[tuner.config_table_name],
-    )
-
-    original_bench = tuner._bench
-    candidate_configs = []
-
-    def checked_bench(*bench_args, config, **meta):
-        assert torch.equal(state, history)
-        result = original_bench(*bench_args, config=config, **meta)
-        assert torch.equal(state, history)
-        candidate_configs.append(config)
-        return result
-
-    monkeypatch.setattr(tuner, "_bench", checked_bench)
-
-    assert torch.equal(state, history)
-    flaggems_vllm.fused_save_compress_norm(*args)
-    assert len(candidate_configs) == len(tuner.configs)
-    assert len(set(candidate_configs)) == len(tuner.configs)
-    assert len(tuner.cache) == 1
-    _assert_results(args, expected_state, expected_latent, kv_before)
-
-    # Restore the same history and verify the cached tuning path.
-    tuned_calls = len(candidate_configs)
-    state.copy_(history)
-    latent.fill_(float("nan"))
-    expected_state, expected_latent = torch_reference(*args)
-    kv_before = kv_score.clone()
-    flaggems_vllm.fused_save_compress_norm(*args)
-    assert len(candidate_configs) == tuned_calls
-    _assert_results(args, expected_state, expected_latent, kv_before)
+    cases = [
+        ((1, 1, 1, 1), (2, 1, 1)),
+        ((8, 8, 1, 1), (2, 1, 1)),
+        ((512, 128, 1, 1), (1, 2, 1)),
+        ((1024, 64, 1, 1), (1, 1, 1)),
+        ((2048, 512, 1, 1), (1, 1, 1)),
+        ((4096, 1, 1, 1), (8, 4, 1)),
+        ((8192, 64, 1, 1), (2, 2, 1)),
+        ((32768, 512, 1, 1), (2, 1, 1)),
+        ((1, 1, 2, 8), (1, 4, 3)),
+        ((8, 8, 2, 8), (1, 4, 3)),
+        ((1024, 64, 2, 8), (1, 4, 1)),
+        ((2048, 512, 2, 8), (1, 4, 1)),
+        ((4096, 1, 2, 8), (2, 4, 3)),
+        ((8192, 64, 2, 8), (2, 2, 1)),
+        ((16384, 256, 2, 8), (2, 4, 2)),
+        ((32768, 512, 2, 8), (2, 2, 1)),
+    ]
+    for (num_tokens, num_reqs, ratio, state_block), expected in cases:
+        actual = select(
+            {
+                "num_tokens": num_tokens,
+                "num_reqs": num_reqs,
+                "COMPRESS_RATIO": ratio,
+                "STATE_BLOCK": state_block,
+            }
+        )
+        assert actual == expected
 
 
 @pytest.mark.parametrize("compress_ratio", [1, 2])
