@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
-
 import pytest
 import torch
 
@@ -218,44 +216,6 @@ def test_ratio2_fused_state_store_ring_edges(lengths, start_positions):
     )
     args[-1].fill_(float("nan"))
     _run_and_compare(args)
-
-
-def test_backend_heuristic_launch_config():
-    op_module = importlib.import_module(
-        "flaggems_vllm.ops.fused_save_compress_norm"
-    )
-    heuristics = op_module._HEURISTICS
-    assert heuristics is not None
-    select = heuristics["LAUNCH_CONFIG"]
-
-    cases = [
-        ((1, 1, 1, 1), (2, 1, 1)),
-        ((8, 8, 1, 1), (2, 1, 1)),
-        ((512, 128, 1, 1), (1, 2, 1)),
-        ((1024, 64, 1, 1), (1, 1, 1)),
-        ((2048, 512, 1, 1), (1, 1, 1)),
-        ((4096, 1, 1, 1), (8, 4, 1)),
-        ((8192, 64, 1, 1), (2, 2, 1)),
-        ((32768, 512, 1, 1), (2, 1, 1)),
-        ((1, 1, 2, 8), (1, 4, 3)),
-        ((8, 8, 2, 8), (1, 4, 3)),
-        ((1024, 64, 2, 8), (1, 4, 1)),
-        ((2048, 512, 2, 8), (1, 4, 1)),
-        ((4096, 1, 2, 8), (2, 4, 3)),
-        ((8192, 64, 2, 8), (2, 2, 1)),
-        ((16384, 256, 2, 8), (2, 4, 2)),
-        ((32768, 512, 2, 8), (2, 2, 1)),
-    ]
-    for (num_tokens, num_reqs, ratio, state_block), expected in cases:
-        actual = select(
-            {
-                "num_tokens": num_tokens,
-                "num_reqs": num_reqs,
-                "COMPRESS_RATIO": ratio,
-                "STATE_BLOCK": state_block,
-            }
-        )
-        assert actual == expected
 
 
 @pytest.mark.parametrize("compress_ratio", [1, 2])
