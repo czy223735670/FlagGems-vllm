@@ -90,9 +90,10 @@ def fused_save_compress_norm(
     predecessor's ring row. It also owns the chunk's first, last, and
     predecessor-collision tail rows. Group programs store the remaining tail
     rows from the pair they already load for pooling, so the raw rows are not
-    read a second time. Ratio 1 has no ring and each program handles up to
-    ``ITEMS_PER_PROGRAM`` valid tokens; ``slot_mapping`` then only marks valid
-    tokens.
+    read a second time. Tiny CR2 inputs use a request-only tail-copy path to
+    avoid metadata overhead when the grid cannot fill the GPU. Ratio 1 has no
+    ring and each program handles up to ``ITEMS_PER_PROGRAM`` valid tokens;
+    ``slot_mapping`` then only marks valid tokens.
 
     Args:
         kv_score: FP32 [tokens, 512] for CR1, [tokens, 1024] for CR2.
@@ -147,6 +148,10 @@ def fused_save_compress_norm(
         num_tokens,
         compress_ratio * items_per_program,
     )
+    use_group_state = compress_ratio == 2 and not (
+        num_tokens <= 8
+        or (2048 < num_tokens <= 4096 and num_reqs <= 8)
+    )
 
     with torch_device_fn.device(kv_score.device):
         _fused_save_compress_norm_grouped_kernel[(grid,)](
@@ -167,6 +172,7 @@ def fused_save_compress_norm(
             COMPRESS_RATIO=compress_ratio,
             EPS=rms_norm_eps,
             JOIN_ROW_PTRS=_JOIN_ROW_PTRS,
+            USE_GROUP_STATE=use_group_state,
             ITEMS_PER_PROGRAM=items_per_program,
             num_warps=num_warps,
             num_stages=num_stages,
@@ -194,6 +200,7 @@ def _fused_save_compress_norm_grouped_kernel(
     COMPRESS_RATIO: tl.constexpr,
     EPS: tl.constexpr,
     JOIN_ROW_PTRS: tl.constexpr,
+    USE_GROUP_STATE: tl.constexpr,
     ITEMS_PER_PROGRAM: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -223,18 +230,35 @@ def _fused_save_compress_norm_grouped_kernel(
                 )
                 _store_latent(pooled, start, norm_weight, latent, d, EPS)
 
-            _store_request_tail(
-                raw,
-                state,
-                state_slots,
-                start,
-                end,
-                d,
-                RAW_STRIDE,
-                STATE_STRIDE,
-                STATE_ROW_STRIDE,
-                STATE_BLOCK,
-            )
+            if USE_GROUP_STATE:
+                _store_request_tail(
+                    raw,
+                    state,
+                    state_slots,
+                    start,
+                    end,
+                    d,
+                    RAW_STRIDE,
+                    STATE_STRIDE,
+                    STATE_ROW_STRIDE,
+                    STATE_BLOCK,
+                )
+            else:
+                num_rows = tl.minimum(end - start, STATE_BLOCK)
+                state_d = tl.arange(0, 1024)
+                for k in tl.range(0, num_rows):
+                    token = end - num_rows + k
+                    slot = tl.load(state_slots + token)
+                    if slot >= 0:
+                        row = _state_row_ptr(
+                            state,
+                            slot,
+                            STATE_STRIDE,
+                            STATE_ROW_STRIDE,
+                            STATE_BLOCK,
+                        )
+                        src = raw + token.to(tl.int64) * RAW_STRIDE
+                        tl.store(row + state_d, tl.load(src + state_d))
             return
 
     if COMPRESS_RATIO == 1:
@@ -284,7 +308,6 @@ def _fused_save_compress_norm_grouped_kernel(
                 if t < num_tokens:
                     req = tl.load(req_ids + t)
                     start = tl.load(query_start_loc + req).to(tl.int64)
-                    end = tl.load(query_start_loc + req + 1).to(tl.int64)
                     state_slot = tl.load(state_slots + t)
                     if t != start:
                         rows = (
@@ -296,19 +319,21 @@ def _fused_save_compress_norm_grouped_kernel(
                         if state_slot >= 0:
                             pooled = tl.sum(kv * tl.softmax(score, 0), 0)
                             _store_latent(pooled, t, norm_weight, latent, d, EPS)
-                        _store_group_state(
-                            kv,
-                            score,
-                            t,
-                            start,
-                            end,
-                            state,
-                            state_slots,
-                            d,
-                            STATE_STRIDE,
-                            STATE_ROW_STRIDE,
-                            STATE_BLOCK,
-                        )
+                        if USE_GROUP_STATE:
+                            end = tl.load(query_start_loc + req + 1).to(tl.int64)
+                            _store_group_state(
+                                kv,
+                                score,
+                                t,
+                                start,
+                                end,
+                                state,
+                                state_slots,
+                                d,
+                                STATE_STRIDE,
+                                STATE_ROW_STRIDE,
+                                STATE_BLOCK,
+                            )
 @triton.jit
 def _pool_with_previous(prev, current, d, JOIN_ROW_PTRS: tl.constexpr):
     if JOIN_ROW_PTRS:
