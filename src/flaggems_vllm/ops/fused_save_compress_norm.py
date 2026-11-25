@@ -15,6 +15,7 @@
 """DeepSeek V4.1 state saving, KV compression, and RMSNorm."""
 
 import inspect
+from contextlib import nullcontext
 
 import torch
 import triton
@@ -44,25 +45,45 @@ _LAUNCH_KWARGS = (
 )
 
 
-def _launch_config(num_tokens, num_reqs, compress_ratio, state_block):
+def _heuristic_args(num_tokens, num_reqs, compress_ratio, state_block):
+    return {
+        "num_tokens": num_tokens,
+        "num_reqs": num_reqs,
+        "COMPRESS_RATIO": compress_ratio,
+        "STATE_BLOCK": state_block,
+    }
+
+
+def _launch_config(args):
     if not _HEURISTICS or "LAUNCH_CONFIG" not in _HEURISTICS:
         raise NotImplementedError(
             "No fused_save_compress_norm heuristic config for this backend"
         )
-    config = _HEURISTICS["LAUNCH_CONFIG"](
-        {
-            "num_tokens": num_tokens,
-            "num_reqs": num_reqs,
-            "COMPRESS_RATIO": compress_ratio,
-            "STATE_BLOCK": state_block,
-        }
-    )
+    config = _HEURISTICS["LAUNCH_CONFIG"](args)
     if len(config) != 3:
         raise ValueError(
             "fused_save_compress_norm heuristic must return "
             "(ITEMS_PER_PROGRAM, num_warps, num_stages)"
         )
     return config
+
+
+def _use_group_state(args):
+    if not _HEURISTICS or "USE_GROUP_STATE" not in _HEURISTICS:
+        raise NotImplementedError(
+            "No fused_save_compress_norm USE_GROUP_STATE heuristic for "
+            "this backend"
+        )
+    use_group_state = _HEURISTICS["USE_GROUP_STATE"](args)
+    if not isinstance(use_group_state, bool):
+        raise ValueError(
+            "fused_save_compress_norm USE_GROUP_STATE heuristic must return bool"
+        )
+    if args["COMPRESS_RATIO"] != 2 and use_group_state:
+        raise ValueError(
+            "fused_save_compress_norm USE_GROUP_STATE requires compress_ratio=2"
+        )
+    return use_group_state
 
 
 def fused_save_compress_norm(
@@ -137,23 +158,26 @@ def fused_save_compress_norm(
     assert num_tokens <= min(kv_score.shape[0], positions.numel())
     if num_tokens == 0:
         return
-    items_per_program, num_warps, num_stages = _launch_config(
+    heuristic_args = _heuristic_args(
         num_tokens,
         num_reqs,
         compress_ratio,
         state_block,
     )
+    items_per_program, num_warps, num_stages = _launch_config(heuristic_args)
+    use_group_state = _use_group_state(heuristic_args)
 
     grid = num_reqs + triton.cdiv(
         num_tokens,
         compress_ratio * items_per_program,
     )
-    use_group_state = compress_ratio == 2 and not (
-        num_tokens <= 8
-        or (2048 < num_tokens <= 4096 and num_reqs <= 8)
-    )
 
-    with torch_device_fn.device(kv_score.device):
+    device_context = (
+        nullcontext()
+        if torch_device_fn.current_device() == kv_score.device.index
+        else torch_device_fn.device(kv_score.device)
+    )
+    with device_context:
         _fused_save_compress_norm_grouped_kernel[(grid,)](
             kv_score,
             positions,

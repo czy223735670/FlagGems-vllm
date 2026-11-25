@@ -116,6 +116,7 @@ def fused_save_compress_norm_launch_config_heur(args):
     shapes; no runtime autotuning is performed.
     """
     num_tokens = args["num_tokens"]
+    num_reqs = args["num_reqs"]
     compress_ratio = args["COMPRESS_RATIO"]
     if compress_ratio == 1:
         if num_tokens <= 8:
@@ -133,14 +134,38 @@ def fused_save_compress_norm_launch_config_heur(args):
     if num_tokens <= 8:
         return 1, 4, 3
     if num_tokens <= 2048:
-        return 1, 4, 1
+        return (1, 2, 1) if num_reqs == 1 else (1, 4, 1)
     if num_tokens <= 4096:
         return 2, 4, 3
+    if (
+        num_tokens > 4096
+        and num_reqs >= 512
+        and num_tokens <= 16 * num_reqs
+    ):
+        return 1, 2, 1
     if num_tokens <= 8192:
         return 2, 2, 1
     if num_tokens <= 16384:
         return 2, 4, 2
     return 2, 2, 1
+
+
+def fused_save_compress_norm_use_group_state_heur(args):
+    """Select who stores the CR2 ring tail state.
+
+    The fused group-state path reuses the raw pair already loaded for pooling.
+    Request-only storage is preferable when the grid is too small to amortize
+    the extra group-program metadata and masked stores.
+    """
+    if args["COMPRESS_RATIO"] != 2:
+        return False
+
+    num_tokens = args["num_tokens"]
+    num_reqs = args["num_reqs"]
+    return not (
+        num_tokens <= 8
+        or (2048 < num_tokens <= 4096 and num_reqs <= 8)
+    )
 
 
 def simple_elementwise_blocksize_heur(args):
@@ -580,6 +605,7 @@ HEURISTICS_CONFIGS = {
     },
     "fused_save_compress_norm": {
         "LAUNCH_CONFIG": fused_save_compress_norm_launch_config_heur,
+        "USE_GROUP_STATE": fused_save_compress_norm_use_group_state_heur,
     },
     "softmax_inner": {
         "TILE_N": softmax_heur_tile_n_inner,
